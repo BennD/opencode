@@ -5,7 +5,6 @@ import { SessionID } from "./schema"
 import { zod } from "@/util/effect-zod"
 import { NonNegativeInt, withStatics } from "@/util/schema"
 import { Effect, Layer, Context, Schema } from "effect"
-import { PluginV2 } from "@/v2/plugin"
 
 export const Info = Schema.Union([
   Schema.Struct({
@@ -62,7 +61,6 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
-    const plugin = yield* PluginV2.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionStatus.state")(() => Effect.succeed(new Map<SessionID, Info>())),
@@ -79,7 +77,6 @@ export const layer = Layer.effect(
 
     const set = Effect.fn("SessionStatus.set")(function* (sessionID: SessionID, status: Info) {
       const data = yield* InstanceState.get(state)
-      yield* plugin.trigger("session.status", { sessionID, status })
       yield* bus.publish(Event.Status, { sessionID, status })
       if (status.type === "idle") {
         yield* bus.publish(Event.Idle, { sessionID })
@@ -93,6 +90,6 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(PluginV2.defaultLayer))
+export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
 
 export * as SessionStatus from "./status"
