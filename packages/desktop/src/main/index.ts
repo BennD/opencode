@@ -2,41 +2,24 @@ import { randomUUID } from "node:crypto"
 import { EventEmitter } from "node:events"
 import { existsSync, mkdirSync, rmSync } from "node:fs"
 import * as http from "node:http"
-import { createServer } from "node:net"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { getCACertificates, setDefaultCACertificates } from "node:tls"
 import type { Event } from "electron"
-import { app, BrowserWindow } from "electron"
+import { app, BrowserWindow, dialog } from "electron"
+import pkg from "electron-updater"
+import { drizzle } from "drizzle-orm/node-sqlite/driver"
+import type { Server } from "virtual:opencode-server"
 
 import contextMenu from "electron-context-menu"
+contextMenu({ showSaveImageAs: true, showLookUpSelection: false, showSearchWithGoogle: false })
 
-import type { InitStep, ServerReadyData, SqliteMigrationProgress, WslConfig } from "../preload/types"
-import { checkAppExists, resolveAppPath, wslPath } from "./apps"
-import { CHANNEL, UPDATER_ENABLED } from "./constants"
-import { registerIpcHandlers, sendDeepLinks, sendMenuCommand, sendSqliteMigrationProgress } from "./ipc"
-import { initLogging } from "./logging"
-import { parseMarkdown } from "./markdown"
-import { createMenu } from "./menu"
-import {
-  getDefaultServerUrl,
-  getWslConfig,
-  preferAppEnv,
-  setDefaultServerUrl,
-  setWslConfig,
-  spawnLocalServer,
-  type SidecarListener,
-} from "./server"
-import {
-  createLoadingWindow,
-  createMainWindow,
-  registerRendererProtocol,
-  setBackgroundColor,
-  setDockIcon,
-} from "./windows"
-import { migrate } from "./migrate"
-import { checkUpdate, checkForUpdates, installUpdate, setupAutoUpdater } from "./updater"
-import { Deferred, Effect, Fiber } from "effect"
+// on macOS apps run in `/` which can cause issues with ripgrep
+try {
+  process.chdir(homedir())
+} catch {}
+
+process.env.OPENCODE_DISABLE_EMBEDDED_WEB_UI = "true"
 
 const APP_NAMES: Record<string, string> = {
   dev: "OpenCode Dev",
@@ -49,15 +32,142 @@ const APP_IDS: Record<string, string> = {
   prod: "ai.opencode.desktop",
 }
 const TEST_ONBOARDING = process.env.OPENCODE_TEST_ONBOARDING === "1"
+const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
+const onboardingTestRoot = ((): string | undefined => {
+  if (!TEST_ONBOARDING) return
 
-let logger: ReturnType<typeof initLogging>
-let mainWindow: BrowserWindow | null = null
-let server: SidecarListener | null = null
+  const root = join(tmpdir(), `opencode-onboarding-${randomUUID()}`)
+  rmSync(root, { recursive: true, force: true })
+  ;["data", "config", "cache", "state", "desktop", "session"].forEach((dir) =>
+    mkdirSync(join(root, dir), { recursive: true }),
+  )
+  process.env.OPENCODE_DB = ":memory:"
+  process.env.XDG_DATA_HOME = join(root, "data")
+  process.env.XDG_CONFIG_HOME = join(root, "config")
+  process.env.XDG_CACHE_HOME = join(root, "cache")
+  process.env.XDG_STATE_HOME = join(root, "state")
+  return root
+})()
+app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "OpenCode Dev")
+app.setAppUserModelId(appId)
+app.setPath("userData", onboardingTestRoot ? join(onboardingTestRoot, "desktop") : join(app.getPath("appData"), appId))
+if (onboardingTestRoot) app.setPath("sessionData", join(onboardingTestRoot, "session"))
+const { autoUpdater } = pkg
+
+import type { InitStep, ServerReadyData, SqliteMigrationProgress } from "../preload/types"
+import { checkAppExists, resolveAppPath, wslPath } from "./apps"
+import { CHANNEL, UPDATER_ENABLED } from "./constants"
+import { registerIpcHandlers, sendDeepLinks, sendMenuCommand, sendSqliteMigrationProgress } from "./ipc"
+import { initLogging } from "./logging"
+import { parseMarkdown } from "./markdown"
+import { createMenu } from "./menu"
+import { allocatePort, getDefaultServerUrl, setDefaultServerUrl, spawnLocalServer, spawnWslSidecar } from "./server"
+import { createWslServersController } from "./wsl-servers"
+import {
+  createLoadingWindow,
+  createMainWindow,
+  registerRendererProtocol,
+  setBackgroundColor,
+  setDockIcon,
+} from "./windows"
+import { migrate } from "./migrate"
 
 const initEmitter = new EventEmitter()
 let initStep: InitStep = { phase: "server_waiting" }
 
+let mainWindow: BrowserWindow | null = null
+let server: Server.Listener | null = null
+const loadingComplete = defer<void>()
+
 const pendingDeepLinks: string[] = []
+
+const serverReady = defer<ServerReadyData>()
+const logger = initLogging()
+const wslServers = createWslServersController(
+  app.getVersion(),
+  async (distro) => {
+    logger.log("spawning wsl sidecar", { distro })
+    return spawnWslSidecar(distro, {
+      onLine: (line) => logger.log("wsl sidecar", { distro, stream: line.stream, text: line.text }),
+    })
+  },
+  {
+    log: (message, meta) => logger.log(message, meta),
+    error: (message, meta) => logger.error(message, meta),
+  },
+)
+
+useSystemCertificates()
+
+logger.log("app starting", {
+  version: app.getVersion(),
+  packaged: app.isPackaged,
+  onboardingTest: Boolean(onboardingTestRoot),
+})
+
+setupApp()
+
+function setupApp() {
+  ensureLoopbackNoProxy()
+  useEnvProxy()
+  app.commandLine.appendSwitch("proxy-bypass-list", "<-loopback>")
+  if (!app.isPackaged) app.commandLine.appendSwitch("remote-debugging-port", "9222")
+
+  if (!app.requestSingleInstanceLock()) {
+    app.quit()
+    return
+  }
+
+  app.on("second-instance", (_event: Event, argv: string[]) => {
+    const urls = argv.filter((arg: string) => arg.startsWith("opencode://"))
+    if (urls.length) {
+      logger.log("deep link received via second-instance", { urls })
+      emitDeepLinks(urls)
+    }
+    focusMainWindow()
+  })
+
+  app.on("open-url", (event: Event, url: string) => {
+    event.preventDefault()
+    logger.log("deep link received via open-url", { url })
+    emitDeepLinks([url])
+  })
+
+  app.on("before-quit", () => {
+    killSidecar()
+    wslServers.stopAll()
+  })
+
+  app.on("will-quit", () => {
+    killSidecar()
+    wslServers.stopAll()
+  })
+
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      killSidecar()
+      wslServers.stopAll()
+      app.exit(0)
+    })
+  }
+
+  void app.whenReady().then(async () => {
+    if (!TEST_ONBOARDING) migrate()
+    app.setAsDefaultProtocolClient("opencode")
+    registerRendererProtocol()
+    setDockIcon()
+    setupAutoUpdater()
+    await initialize()
+  })
+}
+
+function useSystemCertificates() {
+  try {
+    setDefaultCACertificates([...new Set([...getCACertificates("default"), ...getCACertificates("system")])])
+  } catch (error) {
+    logger.warn("failed to load system certificates", error)
+  }
+}
 
 function useEnvProxy() {
   try {
@@ -74,17 +184,166 @@ function emitDeepLinks(urls: string[]) {
   if (mainWindow) sendDeepLinks(mainWindow, urls)
 }
 
+function focusMainWindow() {
+  if (!mainWindow) return
+  mainWindow.show()
+  mainWindow.focus()
+}
+
 function setInitStep(step: InitStep) {
   initStep = step
   logger.log("init step", { step })
   initEmitter.emit("step", step)
 }
 
-async function killSidecar() {
+async function initialize() {
+  const needsMigration = !sqliteFileExists()
+  let overlay: BrowserWindow | null = null
+
+  const port = await allocatePort()
+  const hostname = "127.0.0.1"
+  const url = `http://${hostname}:${port}`
+  const password = randomUUID()
+
+  const loadingTask = (async () => {
+    logger.log("sidecar connection started", { url })
+
+    initEmitter.on("sqlite", (progress: SqliteMigrationProgress) => {
+      setInitStep({ phase: "sqlite_waiting" })
+      if (overlay) sendSqliteMigrationProgress(overlay, progress)
+      if (mainWindow) sendSqliteMigrationProgress(mainWindow, progress)
+    })
+
+    if (needsMigration) {
+      const { Database, JsonMigration } = await import("virtual:opencode-server")
+      await JsonMigration.run(drizzle({ client: Database.Client().$client }), {
+        progress: (event: { current: number; total: number }) => {
+          const percent = Math.round((event.current / event.total) * 100)
+          initEmitter.emit("sqlite", { type: "InProgress", value: percent })
+        },
+      })
+      initEmitter.emit("sqlite", { type: "Done" })
+    }
+
+    logger.log("spawning sidecar", { url })
+    const { listener, health } = await spawnLocalServer(hostname, port, password, () => {
+      ensureLoopbackNoProxy()
+      useEnvProxy()
+    })
+    server = listener
+    serverReady.resolve({
+      url,
+      username: "opencode",
+      password,
+    })
+
+    // Initialize WSL sidecars in parallel; failures do not block app startup.
+    void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
+
+    await Promise.race([
+      health.wait,
+      delay(30_000).then(() => {
+        throw new Error("Sidecar health check timed out")
+      }),
+    ]).catch((error) => {
+      logger.error("sidecar health check failed", error)
+    })
+
+    logger.log("loading task finished")
+  })()
+
+  if (needsMigration) {
+    const show = await Promise.race([loadingTask.then(() => false), delay(1_000).then(() => true)])
+    if (show) {
+      overlay = createLoadingWindow()
+      await delay(1_000)
+    }
+  }
+
+  await loadingTask
+  setInitStep({ phase: "done" })
+
+  if (overlay) {
+    await loadingComplete.promise
+  }
+
+  mainWindow = createMainWindow()
+  wireMenu()
+
+  overlay?.close()
+}
+
+function wireMenu() {
+  if (!mainWindow) return
+  createMenu({
+    trigger: (id) => mainWindow && sendMenuCommand(mainWindow, id),
+    checkForUpdates: () => {
+      void checkForUpdates(true)
+    },
+    reload: () => mainWindow?.reload(),
+    relaunch: () => relaunchApp(),
+  })
+}
+
+registerIpcHandlers({
+  killSidecar: () => killSidecar(),
+  relaunch: () => relaunchApp(),
+  awaitInitialization: async (sendStep) => {
+    sendStep(initStep)
+    const listener = (step: InitStep) => sendStep(step)
+    initEmitter.on("step", listener)
+    try {
+      logger.log("awaiting server ready")
+      const res = await serverReady.promise
+      logger.log("server ready", { url: res.url })
+      return res
+    } finally {
+      initEmitter.off("step", listener)
+    }
+  },
+  getWslServersState: () => wslServers.getState(),
+  onWslServersEvent: (listener) => wslServers.subscribe(listener),
+  wslServersProbeRuntime: () => wslServers.probeRuntime(),
+  wslServersRefreshDistros: () => wslServers.refreshDistros(),
+  wslServersInstallWsl: () => wslServers.installWsl(),
+  wslServersInstallDistro: (name) => wslServers.installDistro(name),
+  wslServersProbeDistro: (name) => wslServers.probeDistro(name),
+  wslServersProbeOpencode: (name) => wslServers.probeOpencode(name),
+  wslServersInstallOpencode: (name) => wslServers.installOpencode(name),
+  wslServersOpenTerminal: (name) => wslServers.openTerminal(name),
+  wslServersAddServer: (distro) => wslServers.addServer(distro),
+  wslServersRemoveServer: (id) => wslServers.removeServer(id),
+  wslServersStartServer: (id) => wslServers.startServer(id),
+  getWindowConfig: () => ({ updaterEnabled: UPDATER_ENABLED }),
+  consumeInitialDeepLinks: () => pendingDeepLinks.splice(0),
+  getDefaultServerUrl: () => getDefaultServerUrl(),
+  setDefaultServerUrl: (url) => setDefaultServerUrl(url),
+  getDisplayBackend: async () => null,
+  setDisplayBackend: async () => undefined,
+  parseMarkdown: async (markdown) => parseMarkdown(markdown),
+  checkAppExists: async (appName) => checkAppExists(appName),
+  wslPath: async (path, mode, distro) => wslPath(path, mode, distro),
+  resolveAppPath: async (appName) => resolveAppPath(appName),
+  loadingWindowComplete: () => loadingComplete.resolve(),
+  runUpdater: async (alertOnFail) => checkForUpdates(alertOnFail),
+  checkUpdate: async () => checkUpdate(),
+  installUpdate: async () => installUpdate(),
+  setBackgroundColor: (color) => setBackgroundColor(color),
+})
+
+function killSidecar() {
   if (!server) return
-  const current = server
+  server.stop()
   server = null
-  await current.stop()
+}
+
+function relaunchApp() {
+  // app.exit() skips before-quit / will-quit, so relaunch callers must
+  // explicitly stop sidecars here rather than relying on process hooks.
+  killSidecar()
+  wslServers.stopAll()
+  app.relaunch()
+  app.exit(0)
 }
 
 function ensureLoopbackNoProxy() {
@@ -107,265 +366,140 @@ function ensureLoopbackNoProxy() {
   upsert("no_proxy")
 }
 
-const main = Effect.gen(function* () {
-  contextMenu({ showSaveImageAs: true, showLookUpSelection: false, showSearchWithGoogle: false })
+function sqliteFileExists() {
+  if (process.env.OPENCODE_DB === ":memory:") return true
+  const xdg = process.env.XDG_DATA_HOME
+  const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".local", "share")
+  return existsSync(join(base, "opencode", "opencode.db"))
+}
 
-  // on macOS apps run in `/` which can cause issues with ripgrep
-  try {
-    process.chdir(homedir())
-  } catch {}
-
-  process.env.OPENCODE_DISABLE_EMBEDDED_WEB_UI = "true"
-
-  const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
-  const onboardingTestRoot = ((): string | undefined => {
-    if (!TEST_ONBOARDING) return
-
-    const root = join(tmpdir(), `opencode-onboarding-${randomUUID()}`)
-    rmSync(root, { recursive: true, force: true })
-    ;["data", "config", "cache", "state", "desktop", "session"].forEach((dir) =>
-      mkdirSync(join(root, dir), { recursive: true }),
-    )
-    process.env.OPENCODE_DB = ":memory:"
-    process.env.XDG_DATA_HOME = join(root, "data")
-    process.env.XDG_CONFIG_HOME = join(root, "config")
-    process.env.XDG_CACHE_HOME = join(root, "cache")
-    process.env.XDG_STATE_HOME = join(root, "state")
-    return root
-  })()
-  app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "OpenCode Dev")
-  app.setAppUserModelId(appId)
-  app.setPath(
-    "userData",
-    onboardingTestRoot ? join(onboardingTestRoot, "desktop") : join(app.getPath("appData"), appId),
-  )
-  if (onboardingTestRoot) app.setPath("sessionData", join(onboardingTestRoot, "session"))
-  logger = initLogging()
-
-  try {
-    setDefaultCACertificates([...new Set([...getCACertificates("default"), ...getCACertificates("system")])])
-  } catch (error) {
-    logger.warn("failed to load system certificates", error)
-  }
-
-  logger.log("app starting", {
-    version: app.getVersion(),
-    packaged: app.isPackaged,
-    onboardingTest: Boolean(onboardingTestRoot),
+function setupAutoUpdater() {
+  if (!UPDATER_ENABLED) return
+  autoUpdater.logger = logger
+  autoUpdater.channel = "latest"
+  autoUpdater.allowPrerelease = false
+  autoUpdater.allowDowngrade = true
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = true
+  logger.log("auto updater configured", {
+    channel: autoUpdater.channel,
+    allowPrerelease: autoUpdater.allowPrerelease,
+    allowDowngrade: autoUpdater.allowDowngrade,
+    currentVersion: app.getVersion(),
   })
+}
 
-  ensureLoopbackNoProxy()
-  useEnvProxy()
-  app.commandLine.appendSwitch("proxy-bypass-list", "<-loopback>")
-  if (!app.isPackaged) app.commandLine.appendSwitch("remote-debugging-port", "9222")
+let downloadedUpdateVersion: string | undefined
 
-  if (!app.requestSingleInstanceLock()) {
-    app.quit()
+async function checkUpdate() {
+  if (!UPDATER_ENABLED) return { updateAvailable: false }
+  if (downloadedUpdateVersion) {
+    logger.log("returning cached downloaded update", {
+      version: downloadedUpdateVersion,
+    })
+    return { updateAvailable: true, version: downloadedUpdateVersion }
+  }
+  logger.log("checking for updates", {
+    currentVersion: app.getVersion(),
+    channel: autoUpdater.channel,
+    allowPrerelease: autoUpdater.allowPrerelease,
+    allowDowngrade: autoUpdater.allowDowngrade,
+  })
+  try {
+    const result = await autoUpdater.checkForUpdates()
+    const updateInfo = result?.updateInfo
+    logger.log("update metadata fetched", {
+      releaseVersion: updateInfo?.version ?? null,
+      releaseDate: updateInfo?.releaseDate ?? null,
+      releaseName: updateInfo?.releaseName ?? null,
+      files: updateInfo?.files?.map((file) => file.url) ?? [],
+    })
+    const version = result?.updateInfo?.version
+    if (result?.isUpdateAvailable === false || !version) {
+      logger.log("no update available", {
+        reason: "provider returned no newer version",
+      })
+      return { updateAvailable: false }
+    }
+    logger.log("update available", { version })
+    await autoUpdater.downloadUpdate()
+    logger.log("update download completed", { version })
+    downloadedUpdateVersion = version
+    return { updateAvailable: true, version }
+  } catch (error) {
+    logger.error("update check failed", error)
+    return { updateAvailable: false, failed: true }
+  }
+}
+
+async function installUpdate() {
+  if (!downloadedUpdateVersion) {
+    logger.log("install update skipped", {
+      reason: "no downloaded update ready",
+    })
+    return
+  }
+  logger.log("installing downloaded update", {
+    version: downloadedUpdateVersion,
+  })
+  killSidecar()
+  wslServers.stopAll()
+  autoUpdater.quitAndInstall()
+}
+
+async function checkForUpdates(alertOnFail: boolean) {
+  if (!UPDATER_ENABLED) return
+  logger.log("checkForUpdates invoked", { alertOnFail })
+  const result = await checkUpdate()
+  if (!result.updateAvailable) {
+    if (result.failed) {
+      logger.log("no update decision", { reason: "update check failed" })
+      if (!alertOnFail) return
+      await dialog.showMessageBox({
+        type: "error",
+        message: "Update check failed.",
+        title: "Update Error",
+      })
+      return
+    }
+
+    logger.log("no update decision", { reason: "already up to date" })
+    if (!alertOnFail) return
+    await dialog.showMessageBox({
+      type: "info",
+      message: "You're up to date.",
+      title: "No Updates",
+    })
     return
   }
 
-  preferAppEnv(app.getPath("userData"))
-
-  app.on("second-instance", (_event: Event, argv: string[]) => {
-    const urls = argv.filter((arg: string) => arg.startsWith("opencode://"))
-    if (urls.length) {
-      logger.log("deep link received via second-instance", { urls })
-      emitDeepLinks(urls)
-    }
-    if (mainWindow) {
-      mainWindow.show()
-      mainWindow.focus()
-    }
+  const response = await dialog.showMessageBox({
+    type: "info",
+    message: `Update ${result.version ?? ""} downloaded. Restart now?`,
+    title: "Update Ready",
+    buttons: ["Restart", "Later"],
+    defaultId: 0,
+    cancelId: 1,
   })
-
-  app.on("open-url", (event: Event, url: string) => {
-    event.preventDefault()
-    logger.log("deep link received via open-url", { url })
-    emitDeepLinks([url])
+  logger.log("update prompt response", {
+    version: result.version ?? null,
+    restartNow: response.response === 0,
   })
-
-  app.on("before-quit", () => {
-    void killSidecar()
-  })
-
-  app.on("will-quit", () => {
-    void killSidecar()
-  })
-
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.on(signal, () => {
-      void killSidecar().finally(() => app.exit(0))
-    })
+  if (response.response === 0) {
+    await installUpdate()
   }
+}
 
-  const serverReady = Deferred.makeUnsafe<ServerReadyData>()
-  const loadingComplete = Deferred.makeUnsafe<void>()
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
-  registerIpcHandlers({
-    killSidecar: () => killSidecar(),
-    awaitInitialization: Effect.fnUntraced(
-      function* (sendStep) {
-        sendStep(initStep)
-        const listener = (step: InitStep) => sendStep(step)
-        initEmitter.on("step", listener)
-        try {
-          logger.log("awaiting server ready")
-          const res = yield* Deferred.await(serverReady)
-          logger.log("server ready", { url: res.url })
-          return res
-        } finally {
-          initEmitter.off("step", listener)
-        }
-      },
-      (e) => Effect.runPromise(e),
-    ),
-    getWindowConfig: () => ({ updaterEnabled: UPDATER_ENABLED }),
-    consumeInitialDeepLinks: () => pendingDeepLinks.splice(0),
-    getDefaultServerUrl: () => getDefaultServerUrl(),
-    setDefaultServerUrl: (url) => setDefaultServerUrl(url),
-    getWslConfig: () => Promise.resolve(getWslConfig()),
-    setWslConfig: (config: WslConfig) => setWslConfig(config),
-    getDisplayBackend: async () => null,
-    setDisplayBackend: async () => undefined,
-    parseMarkdown: async (markdown) => parseMarkdown(markdown),
-    checkAppExists: (appName) => checkAppExists(appName),
-    wslPath: async (path, mode) => wslPath(path, mode),
-    resolveAppPath: async (appName) => resolveAppPath(appName),
-    loadingWindowComplete: () => Deferred.doneUnsafe(loadingComplete, Effect.void),
-    runUpdater: async (alertOnFail) => checkForUpdates(alertOnFail, killSidecar),
-    checkUpdate: async () => checkUpdate(),
-    installUpdate: async () => installUpdate(killSidecar),
-    setBackgroundColor: (color) => setBackgroundColor(color),
+function defer<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
   })
-
-  yield* Effect.promise(() => app.whenReady())
-
-  if (!TEST_ONBOARDING) migrate()
-  app.setAsDefaultProtocolClient("opencode")
-  registerRendererProtocol()
-  setDockIcon()
-  setupAutoUpdater()
-
-  const needsMigration = ((): boolean => {
-    if (process.env.OPENCODE_DB === ":memory:") return false
-
-    const xdg = process.env.XDG_DATA_HOME
-    const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".local", "share")
-    return !existsSync(join(base, "opencode", "opencode.db"))
-  })()
-  let overlay: BrowserWindow | null = null
-
-  const port = yield* Effect.gen(function* () {
-    const fromEnv = process.env.OPENCODE_PORT
-    if (fromEnv) {
-      const parsed = Number.parseInt(fromEnv, 10)
-      if (!Number.isNaN(parsed)) return parsed
-    }
-
-    const res = yield* Deferred.make<number, unknown>()
-    const server = createServer()
-    server.on("error", (e) => Deferred.failSync(res, () => e))
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address()
-      if (typeof address !== "object" || !address) {
-        server.close()
-        Deferred.failSync(res, () => new Error("Failed to get port"))
-        return
-      }
-      const port = address.port
-      server.close(() => Effect.runSync(Deferred.succeed(res, port)))
-    })
-
-    return yield* Deferred.await(res)
-  })
-  const hostname = "127.0.0.1"
-  const url = `http://${hostname}:${port}`
-  const password = randomUUID()
-
-  const loadingTask = yield* Effect.gen(function* () {
-    logger.log("sidecar connection started", { url })
-
-    initEmitter.on("sqlite", (progress: SqliteMigrationProgress) => {
-      setInitStep({ phase: "sqlite_waiting" })
-      if (overlay) sendSqliteMigrationProgress(overlay, progress)
-      if (mainWindow) sendSqliteMigrationProgress(mainWindow, progress)
-    })
-
-    logger.log("spawning sidecar", { url })
-    const { listener, health } = yield* Effect.promise(() =>
-      spawnLocalServer(
-        hostname,
-        port,
-        password,
-        () => {
-          ensureLoopbackNoProxy()
-          useEnvProxy()
-        },
-        {
-          needsMigration,
-          userDataPath: app.getPath("userData"),
-          onSqliteProgress: (progress) => initEmitter.emit("sqlite", progress),
-          onStdout: (message) => logger.log("sidecar stdout", { message }),
-          onStderr: (message) => logger.warn("sidecar stderr", { message }),
-          onExit: (code) => logger.warn("sidecar exited", { code }),
-        },
-      ),
-    )
-    server = listener
-    yield* Deferred.succeed(serverReady, {
-      url,
-      username: "opencode",
-      password,
-    })
-
-    yield* Effect.promise(() => health.wait).pipe(
-      Effect.timeout("30 seconds"),
-      Effect.catch((e) =>
-        Effect.sync(() => {
-          logger.error("sidecar health check failed", e.toString())
-        }),
-      ),
-    )
-
-    logger.log("loading task finished")
-  }).pipe(Effect.forkChild)
-
-  if (needsMigration) {
-    const show = yield* loadingTask.pipe(
-      Fiber.await,
-      Effect.timeout("1 second"),
-      Effect.as(false),
-      Effect.catch(() => Effect.succeed(true)),
-    )
-    if (show) {
-      overlay = createLoadingWindow()
-      yield* Effect.sleep("1 second")
-    }
-  }
-
-  yield* Fiber.await(loadingTask)
-  setInitStep({ phase: "done" })
-
-  if (overlay) yield* Deferred.await(loadingComplete)
-
-  mainWindow = createMainWindow()
-  if (mainWindow) {
-    createMenu({
-      trigger: (id) => mainWindow && sendMenuCommand(mainWindow, id),
-      checkForUpdates: () => {
-        void checkForUpdates(true, killSidecar)
-      },
-      reload: () => mainWindow?.reload(),
-      relaunch: () => {
-        void killSidecar().finally(() => {
-          app.relaunch()
-          app.exit(0)
-        })
-      },
-    })
-  }
-
-  overlay?.close()
-})
-
-Effect.runFork(main)
+  return { promise, resolve, reject }
+}
